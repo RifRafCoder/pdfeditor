@@ -6,12 +6,13 @@ import tempfile
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://eaba3391-227e-4abe-a519-84a02fedd2a7.lovableproject.com"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],  # or ["POST"]
     allow_headers=["*"],
 )
 
