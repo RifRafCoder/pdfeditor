@@ -9,7 +9,10 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://eaba3391-227e-4abe-a519-84a02fedd2a7.lovableproject.com"],
+    allow_origins=[
+        "https://eaba3391-227e-4abe-a519-84a02fedd2a7.lovableproject.com",
+        "https://id-preview--eaba3391-227e-4abe-a519-84a02fedd2a7.lovable.app"
+    ],
     allow_credentials=True,
     allow_methods=["POST"], 
     allow_headers=["*"],
