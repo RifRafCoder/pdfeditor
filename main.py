@@ -1,11 +1,13 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pdfplumber
+import requests
 import tempfile
 
 app = FastAPI()
 
-# ✅ CORS settings for Lovable preview + live
+# ✅ Add both Lovable domains here
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -14,16 +16,29 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-# ✅ New route: Accepts direct file uploads
+# ✅ CORS test route
+@app.get("/test-cors")
+def test_cors():
+    return {"message": "✅ CORS is working!"}
+
+# ✅ Health check for OPTIONS preflight requests
+@app.options("/extract-transactions")
+def preflight_check():
+    return {"status": "ok"}
+
+# ✅ Main extraction route
+class PDFInput(BaseModel):
+    url: str
+
 @app.post("/extract-transactions")
-async def extract_transactions(file: UploadFile = File(...)):
+def extract_transactions(data: PDFInput):
     try:
+        response = requests.get(data.url)
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
-            content = await file.read()
-            tmp_file.write(content)
+            tmp_file.write(response.content)
             tmp_file.flush()
 
             transactions = []
