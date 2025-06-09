@@ -1,12 +1,13 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pdfplumber
 import requests
 import tempfile
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
+# ✅ Add both Lovable domains here
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -14,15 +15,21 @@ app.add_middleware(
         "https://id-preview--eaba3391-227e-4abe-a519-84a02fedd2a7.lovable.app"
     ],
     allow_credentials=True,
-    allow_methods=["POST"], 
-    allow_headers=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
+# ✅ CORS test route
 @app.get("/test-cors")
-def test():
-    return {"message": "CORS is working!"}
+def test_cors():
+    return {"message": "✅ CORS is working!"}
 
+# ✅ Health check for OPTIONS preflight requests
+@app.options("/extract-transactions")
+def preflight_check():
+    return {"status": "ok"}
 
+# ✅ Main extraction route
 class PDFInput(BaseModel):
     url: str
 
@@ -39,7 +46,7 @@ def extract_transactions(data: PDFInput):
                 for page in pdf.pages:
                     table = page.extract_table()
                     if table:
-                        for row in table[1:]:  # Skip header
+                        for row in table[1:]:
                             try:
                                 date, description, amount = row[0], row[1], row[2]
                                 transactions.append({
@@ -47,7 +54,7 @@ def extract_transactions(data: PDFInput):
                                     "description": description.strip(),
                                     "amount": amount.strip()
                                 })
-                            except Exception:
+                            except:
                                 continue
         return {"transactions": transactions}
     except Exception as e:
