@@ -18,6 +18,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/test-cors")
+def test():
+    return {"message": "CORS is working!"}
+
+
 class PDFInput(BaseModel):
     url: str
 
