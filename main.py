@@ -14,7 +14,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://eaba3391-227e-4abe-a519-84a02fedd2a7.lovableproject.com",
-        "https://id-preview--eaba3391-227e-4abe-a519-84a02fedd2a7.lovable.app"
+        "https://id-preview--eaba3391-227e-4abe-a519-84a02fedd2a7.lovable.app",
+        "https://14d3c89d-ca06-45cc-9164-93a318796f46.lovableproject.com",
+        "https://id-preview--14d3c89d-ca06-45cc-9164-93a318796f46.lovable.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
