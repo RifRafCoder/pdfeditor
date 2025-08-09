@@ -4,7 +4,7 @@ import pdfplumber
 import tempfile
 import logging
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -24,160 +24,126 @@ app.add_middleware(
 
 MONTHS = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"}
 
-def is_date_cell(s: str) -> bool:
-    if not s: 
-        return False
-    t = s.strip()
-    # e.g., "Jun 27", "Jul 2", "Jun 21 Opening Balance"
-    parts = t.split()
-    if len(parts) >= 2 and parts[0][:3].title() in MONTHS:
-        # First two tokens look like a month and day number
-        return re.match(r"^\d{1,2}$", parts[1]) is not None
-    return False
+def clean(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
 
-def clean(s):
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def is_month(s: str) -> bool:
+    s = clean(s)
+    return s[:3].title() in MONTHS
 
-def parse_amount(s: str):
+def is_day(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}", clean(s)))
+
+def parse_amt(s: str):
     s = clean(s).replace(",", "")
+    s = re.sub(r"[^\d\.\-]", "", s)
     if s in ("", "-"):
         return None
     try:
         return Decimal(s)
-    except (InvalidOperation, TypeError):
+    except Exception:
         return None
 
+# Multiple strategies help pdfplumber on gridless statements
 TABLE_SETTINGS_CANDIDATES = [
-    # Try text-based detection (works on gridless statements)
     dict(vertical_strategy="text", horizontal_strategy="text",
          snap_x_tolerance=3, snap_y_tolerance=3, text_tolerance=6),
-    # Try line-based if there are ruling lines
-    dict(vertical_strategy="lines", horizontal_strategy="lines"),
-    # Mixed
-    dict(vertical_strategy="lines", horizontal_strategy="text"),
     dict(vertical_strategy="text", horizontal_strategy="lines"),
+    dict(vertical_strategy="lines", horizontal_strategy="text"),
+    dict(vertical_strategy="lines", horizontal_strategy="lines"),
 ]
 
-def looks_like_header(row):
-    if not row: 
-        return False
-    joined = " ".join([clean(c).lower() for c in row])
-    return all(k in joined for k in ["date", "transactions"]) and (
-        "withdrawn" in joined or "withdraw" in joined
-    ) and ("deposit" in joined) and ("balance" in joined)
+def extract_withdraw_deposit(cells):
+    """
+    Rows vary by page. Try two common patterns and pick what yields data:
+    A) withdrawn=cells[-2], deposited=cells[-1]
+    B) withdrawn=cells[-3], deposited=cells[-2]
+    """
+    cand = []
+    if len(cells) >= 2:
+        wA, dA = parse_amt(cells[-2]), parse_amt(cells[-1])
+        cand.append(("A", wA, dA))
+    if len(cells) >= 3:
+        wB, dB = parse_amt(cells[-3]), parse_amt(cells[-2])
+        cand.append(("B", wB, dB))
+    # choose the candidate with more non-None values; tie-break prefers A
+    best = max(cand, key=lambda x: ((x[1] is not None) + (x[2] is not None), 1 if x[0]=="A" else 0))
+    return best[1], best[2]
 
 @app.post("/extract-transactions")
 async def extract_transactions(file: UploadFile = File(...)):
     try:
-        # Save temp file
+        # Save to a temp file
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             content = await file.read()
             tmp_file.write(content)
             tmp_file.flush()
             tmp_path = tmp_file.name
 
-        all_transactions = []
-        headers = None
+        transactions = []
+        headers = ["Date", "Description", "Withdrawn", "Deposited", "Amount"]
 
         with pdfplumber.open(tmp_path) as pdf:
+            total_rows_seen = 0
             for page_num, page in enumerate(pdf.pages, start=1):
-                tables = []
+                chosen = None
                 for ts in TABLE_SETTINGS_CANDIDATES:
                     try:
                         tables = page.extract_tables(table_settings=ts)
                         if tables:
+                            chosen = tables[0]  # the big one on Scotiabank statements
                             break
-                    except Exception as _:
+                    except Exception:
                         continue
-
-                if not tables:
-                    logging.info(f"No tables found on page {page_num}")
-                    continue
-
-                # Pick the most "promising" table: prefer one with a header row we recognize
-                chosen = None
-                for tbl in tables:
-                    if not tbl or not any(tbl):
-                        continue
-                    if looks_like_header(tbl[0]):
-                        chosen = tbl
-                        break
-                if chosen is None:
-                    # fallback: largest table by row count
-                    chosen = max(tables, key=lambda t: len(t) if t else 0)
 
                 if not chosen:
+                    logging.info(f"[Pg {page_num}] No tables found")
                     continue
 
-                # Normalize rows to 5 columns if possible
-                # Some cells may be None—coerce to empty strings
-                norm = [[clean(c) for c in (row or [])] for row in chosen]
+                total_rows_seen += len(chosen)
+                logging.info(f"[Pg {page_num}] Rows detected: {len(chosen)}")
 
-                # Find header row
-                hdr_row_idx = None
-                for i, row in enumerate(norm):
-                    if looks_like_header(row):
-                        hdr_row_idx = i
-                        break
-
-                if hdr_row_idx is None:
-                    # Some PDFs render the header split across lines; try a heuristic:
-                    # look for a row with at least 4 of the expected keys
-                    for i, row in enumerate(norm[:5]):
-                        joined = " ".join(row).lower()
-                        score = sum(k in joined for k in ["date","transactions","withdraw","withdrawn","deposited","balance"])
-                        if score >= 4:
-                            hdr_row_idx = i
-                            break
-
-                data_rows = norm[hdr_row_idx+1:] if hdr_row_idx is not None else norm
-
-                # Establish headers for response
-                headers = headers or ["Date", "Transactions", "Withdrawn", "Deposited", "Balance"]
-
-                # Parse into transactions; merge description continuations
                 current = None
-                for ridx, row in enumerate(data_rows, start=1):
-                    # pad to 5 columns
-                    row = (row + [""]*5)[:5]
-                    date, desc, withdrawn, deposited, balance = row
-
-                    # Skip boilerplate
-                    junk = "continued on next page"
-                    if junk in " ".join(row).lower():
+                for idx, row in enumerate(chosen):
+                    cells = [clean(c) for c in (row or [])]
+                    if not any(cells):
                         continue
 
-                    # Continuation line: no date, mostly description
-                    if not is_date_cell(date) and desc:
+                    if idx == 0:
+                        # Header-ish row on some pages — skip if it looks like one
+                        joined = " ".join(cells).lower()
+                        if ("transactions" in joined) or ("withdrawn" in joined) or ("deposited" in joined):
+                            continue
+
+                    first = cells[0]
+                    second = cells[1] if len(cells) > 1 else ""
+
+                    # Detect date in two shapes: ("Jun","27") or "Jun 27"
+                    date = None
+                    rest = None
+                    if is_month(first) and is_day(second):
+                        date = f"{first} {second}"
+                        rest = cells[2:]
+                    elif re.match(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}$", first):
+                        date = first
+                        rest = cells[1:]
+
+                    if date:
+                        # Flush previous transaction
                         if current:
-                            # append line to description
-                            current["description"] = clean(current["description"] + " " + desc)
-                            # fill any amounts that might be split on next line (rare)
-                            if not current.get("withdrawn"):
-                                w = parse_amount(withdrawn)
-                                if w is not None:
-                                    current["withdrawn"] = str(w)
-                            if not current.get("deposited"):
-                                d = parse_amount(deposited)
-                                if d is not None:
-                                    current["deposited"] = str(d)
-                            if not current.get("balance"):
-                                b = parse_amount(balance)
-                                if b is not None:
-                                    current["balance"] = str(b)
-                        continue
+                            transactions.append(current)
 
-                    # New transaction line
-                    if is_date_cell(date):
-                        # Finish previous
-                        if current:
-                            all_transactions.append(current)
+                        # Description = everything except the last 3 (amounts) if present
+                        if rest is None:
+                            desc_parts = []
+                            w = d = None
+                        else:
+                            desc_parts = rest[:-3] if len(rest) >= 3 else rest
+                            w, d = extract_withdraw_deposit(rest) if len(rest) >= 2 else (None, None)
 
-                        w = parse_amount(withdrawn)
-                        d = parse_amount(deposited)
-                        b = parse_amount(balance)
-
-                        # Compute a signed "amount" field for convenience
+                        description = " ".join([c for c in desc_parts if c]).strip()
                         amount = None
                         if w is not None and (d is None or w != 0):
                             amount = -w
@@ -185,29 +151,42 @@ async def extract_transactions(file: UploadFile = File(...)):
                             amount = d
 
                         current = {
-                            "date": date.strip(),
-                            "description": desc.strip(),
+                            "date": date,
+                            "description": description,
                             "withdrawn": str(w) if w is not None else "",
                             "deposited": str(d) if d is not None else "",
-                            "balance": str(b) if b is not None else "",
                             "amount": str(amount) if amount is not None else "",
                         }
                     else:
-                        # Row with nothing usable
-                        continue
+                        # Continuation line (no date): append to last description, try to fill amounts
+                        if not current:
+                            continue
+                        # treat everything except last 3 cells as description continuation
+                        cont_desc = " ".join([c for c in cells[:-3]]) if len(cells) >= 3 else " ".join(cells)
+                        current["description"] = clean(f'{current["description"]} {cont_desc}'.strip())
 
-                # flush last row for this page
+                        if len(cells) >= 2:
+                            w_cont, d_cont = extract_withdraw_deposit(cells)
+                            if not current["withdrawn"] and w_cont is not None:
+                                current["withdrawn"] = str(w_cont)
+                                current["amount"] = str(-w_cont)
+                            if not current["deposited"] and d_cont is not None:
+                                current["deposited"] = str(d_cont)
+                                current["amount"] = str(d_cont)
+
+                # flush last row on the page
                 if current:
-                    all_transactions.append(current)
+                    transactions.append(current)
                     current = None
 
-        logging.info(f"📊 Total transactions extracted: {len(all_transactions)}")
+        logging.info(f"📊 Total table rows seen (all pages): {total_rows_seen}")
+        logging.info(f"📊 Total transactions extracted: {len(transactions)}")
+
         return {
-            "headers": headers or ["Date", "Transactions", "Withdrawn", "Deposited", "Balance", "Amount"],
-            "transactions": all_transactions
+            "headers": headers,
+            "transactions": transactions
         }
 
     except Exception as e:
         logging.exception("Error extracting transactions")
         return {"error": str(e)}
-
