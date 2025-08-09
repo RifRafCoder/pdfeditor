@@ -33,6 +33,7 @@ async def extract_transactions(file: UploadFile = File(...)):
             tmp_path = tmp_file.name
 
         transactions = []
+        headers = None  # <-- initialize headers here
 
         with pdfplumber.open(tmp_path) as pdf:
             for page_number, page in enumerate(pdf.pages):
@@ -53,11 +54,10 @@ async def extract_transactions(file: UploadFile = File(...)):
 
         logging.info(f"📊 Total transactions extracted: {len(transactions)}")
         return {
-            "headers": headers,
+            "headers": headers if headers else [],
             "transactions": transactions
         }
 
     except Exception as e:
         logging.error(" Error: %s", str(e))
         return {"error": str(e)}
-
