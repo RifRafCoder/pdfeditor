@@ -1,27 +1,39 @@
-from fastapi import FastAPI, File, UploadFile
+# main.py
+from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
 import tempfile
 import logging
 import re
 from decimal import Decimal
+import httpx
+from typing import Optional
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
+# --- CORS ---
+ALLOWED_ORIGINS = [
+    "https://eaba3391-227e-4abe-a519-84a02fedd2a7.lovableproject.com",
+    "https://id-preview--eaba3391-227e-4abe-a519-84a02fedd2a7.lovable.app",
+    "https://14d3c89d-ca06-45cc-9164-93a318796f46.lovableproject.com",
+    "https://id-preview--14d3c89d-ca06-45cc-9164-93a318796f46.lovable.app",
+    # add any new lovable preview domains here
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://eaba3391-227e-4abe-a519-84a02fedd2a7.lovableproject.com",
-        "https://id-preview--eaba3391-227e-4abe-a519-84a02fedd2a7.lovable.app",
-        "https://14d3c89d-ca06-45cc-9164-93a318796f46.lovableproject.com",
-        "https://id-preview--14d3c89d-ca06-45cc-9164-93a318796f46.lovable.app"
-    ],
+    allow_origins=ALLOWED_ORIGINS + ["*"],  # loosen if needed during dev
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- Health check ---
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+# --- Helpers for extraction ---
 MONTHS = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"}
 
 def clean(s: str) -> str:
@@ -46,7 +58,6 @@ def parse_amt(s: str):
     except Exception:
         return None
 
-# Multiple strategies help pdfplumber on gridless statements
 TABLE_SETTINGS_CANDIDATES = [
     dict(vertical_strategy="text", horizontal_strategy="text",
          snap_x_tolerance=3, snap_y_tolerance=3, text_tolerance=6),
@@ -56,11 +67,6 @@ TABLE_SETTINGS_CANDIDATES = [
 ]
 
 def extract_withdraw_deposit(cells):
-    """
-    Rows vary by page. Try two common patterns and pick what yields data:
-    A) withdrawn=cells[-2], deposited=cells[-1]
-    B) withdrawn=cells[-3], deposited=cells[-2]
-    """
     cand = []
     if len(cells) >= 2:
         wA, dA = parse_amt(cells[-2]), parse_amt(cells[-1])
@@ -68,16 +74,23 @@ def extract_withdraw_deposit(cells):
     if len(cells) >= 3:
         wB, dB = parse_amt(cells[-3]), parse_amt(cells[-2])
         cand.append(("B", wB, dB))
-    # choose the candidate with more non-None values; tie-break prefers A
+    if not cand:
+        return None, None
     best = max(cand, key=lambda x: ((x[1] is not None) + (x[2] is not None), 1 if x[0]=="A" else 0))
     return best[1], best[2]
 
+# --- PDF extraction endpoint (yours, kept) ---
 @app.post("/extract-transactions")
 async def extract_transactions(file: UploadFile = File(...)):
     try:
-        # Save to a temp file
+        if file.content_type != "application/pdf":
+            # Some browsers don’t set content_type; we’ll allow anyway
+            logging.info(f"Incoming content_type: {file.content_type}")
+
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail="Empty file")
             tmp_file.write(content)
             tmp_file.flush()
             tmp_path = tmp_file.name
@@ -92,10 +105,11 @@ async def extract_transactions(file: UploadFile = File(...)):
                 for ts in TABLE_SETTINGS_CANDIDATES:
                     try:
                         tables = page.extract_tables(table_settings=ts)
-                        if tables:
-                            chosen = tables[0]  # the big one on Scotiabank statements
+                        if tables and len(tables[0]) > 0:
+                            chosen = tables[0]
                             break
-                    except Exception:
+                    except Exception as e:
+                        logging.debug(f"Table parse attempt failed: {e}")
                         continue
 
                 if not chosen:
@@ -112,7 +126,6 @@ async def extract_transactions(file: UploadFile = File(...)):
                         continue
 
                     if idx == 0:
-                        # Header-ish row on some pages — skip if it looks like one
                         joined = " ".join(cells).lower()
                         if ("transactions" in joined) or ("withdrawn" in joined) or ("deposited" in joined):
                             continue
@@ -120,7 +133,6 @@ async def extract_transactions(file: UploadFile = File(...)):
                     first = cells[0]
                     second = cells[1] if len(cells) > 1 else ""
 
-                    # Detect date in two shapes: ("Jun","27") or "Jun 27"
                     date = None
                     rest = None
                     if is_month(first) and is_day(second):
@@ -131,11 +143,9 @@ async def extract_transactions(file: UploadFile = File(...)):
                         rest = cells[1:]
 
                     if date:
-                        # Flush previous transaction
                         if current:
                             transactions.append(current)
 
-                        # Description = everything except the last 3 (amounts) if present
                         if rest is None:
                             desc_parts = []
                             w = d = None
@@ -158,10 +168,8 @@ async def extract_transactions(file: UploadFile = File(...)):
                             "amount": str(amount) if amount is not None else "",
                         }
                     else:
-                        # Continuation line (no date): append to last description, try to fill amounts
                         if not current:
                             continue
-                        # treat everything except last 3 cells as description continuation
                         cont_desc = " ".join([c for c in cells[:-3]]) if len(cells) >= 3 else " ".join(cells)
                         current["description"] = clean(f'{current["description"]} {cont_desc}'.strip())
 
@@ -174,7 +182,6 @@ async def extract_transactions(file: UploadFile = File(...)):
                                 current["deposited"] = str(d_cont)
                                 current["amount"] = str(d_cont)
 
-                # flush last row on the page
                 if current:
                     transactions.append(current)
                     current = None
@@ -182,11 +189,43 @@ async def extract_transactions(file: UploadFile = File(...)):
         logging.info(f"📊 Total table rows seen (all pages): {total_rows_seen}")
         logging.info(f"📊 Total transactions extracted: {len(transactions)}")
 
-        return {
-            "headers": headers,
-            "transactions": transactions
-        }
+        return {"headers": headers, "transactions": transactions}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("Error extracting transactions")
         return {"error": str(e)}
+
+# --- PDF proxy for canvas preview (use in Lovable) ---
+@app.get("/pdf-proxy")
+async def pdf_proxy(
+    src: str = Query(..., description="Public or signed URL to the PDF"),
+    filename: Optional[str] = Query("document.pdf")
+):
+    """
+    Fetches a PDF from `src` and returns raw bytes with friendly headers.
+    Use this URL in your Lovable PDF.js loader:
+      /pdf-proxy?src=<encoded_pdf_url>
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            # If your storage needs auth, add headers here:
+            # headers = {"Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}"}
+            r = await client.get(src)  # , headers=headers
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=f"Upstream error: {r.status_code}")
+
+        headers = {
+            "Content-Type": "application/pdf",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",  # helps PDF.js; also okay if client disables range
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store",
+        }
+        return Response(content=r.content, headers=headers, media_type="application/pdf")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Proxy network error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Proxy failed: {e}")
+
