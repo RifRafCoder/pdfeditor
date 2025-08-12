@@ -1,5 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pdfplumber
 requests
 python-multipart
+httpx
